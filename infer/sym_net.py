@@ -3,6 +3,7 @@ import random
 
 import tensorflow as tf
 import numpy as np
+from tensorflow.keras.layers import Dense, LayerNormalization, Dropout, MultiHeadAttention
 
 from util import np_pad
 
@@ -174,74 +175,24 @@ class SymNet:
 
                 print 'feats_cnn_reduced: {}'.format(feats_conv.get_shape())
 
-        # Project to RNN size
-        rnn_output_inspect = None
+        # Transformer
+        transformer_output = feats_conv
+        transformer_output_size = nfeats_conv
         if do_rnn:
-            nfeats_nosym = nfeats_conv + other_nfeats
-            # TODO: should this be on cpu? (batch_size, nunroll, sym_embedding_size + nfeats)
-            feats_nosym = tf.concat(1, [feats_conv, feats_other])
-
-            with tf.variable_scope('rnn_proj'):
-                rnn_proj_sym_w = tf.get_variable('W', [nfeats_sym, rnn_size], initializer=rnn_proj_init, dtype=dtype)
-                rnn_proj_nosym_w = tf.get_variable('nosym_W', [nfeats_nosym, rnn_size], initializer=rnn_proj_init, dtype=dtype)
-                rnn_proj_b = tf.get_variable('b', [rnn_size], initializer=tf.constant_initializer(0.0), dtype=dtype)
-
-            rnn_inputs_sym = tf.matmul(feats_sym, rnn_proj_sym_w)
-            rnn_inputs_nosym = tf.matmul(feats_nosym, rnn_proj_nosym_w)
-            rnn_inputs_prebias = tf.add(rnn_inputs_sym, rnn_inputs_nosym)
-            rnn_inputs = tf.nn.bias_add(rnn_inputs_prebias, rnn_proj_b)
-            rnn_inputs = tf.reshape(rnn_inputs, shape=[batch_size, nunroll, rnn_size])
-            rnn_inputs = tf.split(1, nunroll, rnn_inputs)
-            rnn_inputs = [tf.squeeze(input_, [1]) for input_ in rnn_inputs]
-
-            if rnn_cell_type == 'rnn':
-                cell_fn = tf.nn.rnn_cell.BasicRNNCell
-            elif rnn_cell_type == 'gru':
-                cell_fn = tf.nn.rnn_cell.GRUCell
-            elif rnn_cell_type == 'lstm':
-                cell_fn = tf.nn.rnn_cell.BasicLSTMCell
-            else:
-                raise NotImplementedError()
-            cell = cell_fn(rnn_size)
-
-            if mode == 'train' and rnn_keep_prob < 1.0:
-                cell = tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=rnn_keep_prob)
-
-            if rnn_nlayers > 1:
-                cell = tf.nn.rnn_cell.MultiRNNCell([cell] * rnn_nlayers)
-
-            initial_state = cell.zero_state(batch_size, dtype)
-
-            # RNN
-            # TODO: weight init
-            with tf.variable_scope('rnn_unroll'):
-                state = initial_state
-                outputs = []
-                for i in xrange(nunroll):
-                    if i > 0:
-                        tf.get_variable_scope().reuse_variables()
-                    (cell_output, state) = cell(rnn_inputs[i], state)
-                    outputs.append(cell_output)
-                final_state = state
-
-            rnn_output_inspect = tf.concat(1, outputs)
-
-            rnn_output = tf.reshape(rnn_output_inspect, [batch_size * nunroll, rnn_size])
-            rnn_output_size = rnn_size
-        else:
-            nfeats_tot = nfeats_sym + nfeats_conv + other_nfeats
-            feats_all = tf.concat(1, [feats_sym, feats_conv, feats_other])
-            rnn_output = tf.reshape(feats_all, shape=[batch_size, in_nunroll * nfeats_tot])
-            rnn_output_size = in_nunroll * nfeats_tot
-        print 'rnn_output: {}'.format(rnn_output.get_shape())
+            transformer_layer = MultiHeadAttention(num_heads=8, key_dim=rnn_size)
+            transformer_output = transformer_layer(feats_conv, feats_conv)
+            transformer_output = LayerNormalization()(transformer_output)
+            transformer_output = Dropout(rnn_keep_prob)(transformer_output, training=(mode == 'train'))
+            transformer_output_size = rnn_size
+        print 'transformer_output: {}'.format(transformer_output.get_shape())
 
         # Dense NN
-        dnn_output = rnn_output
-        dnn_output_size = rnn_output_size
+        dnn_output = transformer_output
+        dnn_output_size = transformer_output_size
         dnn_output_inspect = None
         if do_dnn:
-            last_layer = rnn_output
-            last_layer_size = rnn_output_size
+            last_layer = transformer_output
+            last_layer_size = transformer_output_size
             for i, layer_size in enumerate(dnn_sizes):
                 layer_name = 'dnn_{}'.format(i)
                 with tf.variable_scope(layer_name):
@@ -280,7 +231,7 @@ class SymNet:
                 softmax_b = tf.get_variable('softmax_b', [out_len])
 
                 # Concat outputs to (batch_size, nunroll * rnn_size)
-                output = tf.concat(1, outputs)
+                output = tf.concat(outputs, axis=1)
                 # TODO: remove this once verify that it's unnecessary
                 output = tf.reshape(output, [batch_size, out_nunroll, rnn_size])
                 # Reshape outputs to (batch_size * nunroll, rnn_size) for matmul
@@ -358,8 +309,8 @@ class SymNet:
         if mode == 'train':
             self.train_op = train_op
         if mode != 'train' and do_rnn:
-            self.initial_state = initial_state
-            self.final_state = final_state
+            self.initial_state = None
+            self.final_state = None
 
         self.mode = mode
         self.batch_size = batch_size

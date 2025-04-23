@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 
-from onset_cnn import OnsetCNN
+from onset_net import OnsetNet
 from util import *
 
 tf.app.flags.DEFINE_string('data_txt_fp', '', 'Training dataset txt file with a list of pickled song files')
@@ -33,11 +33,30 @@ def test():
     # Create model
     print 'Creating model'
     dense_layer_sizes = [int(x) for x in FLAGS.dense_layer_sizes.split(',')]
-    model = OnsetCNN(context_radius=FLAGS.context_radius,
-                     feat_dim=FLAGS.feat_dim,
-                     nchannels=FLAGS.nchannels,
-                     dense_layer_sizes=dense_layer_sizes,
-                     export_feature_layer=FLAGS.export_feature_layer)
+    model = OnsetNet(mode='eval',
+                     batch_size=BATCH_SIZE,
+                     audio_context_radius=FLAGS.context_radius,
+                     audio_nbands=FLAGS.feat_dim,
+                     audio_nchannels=FLAGS.nchannels,
+                     nfeats=0,
+                     cnn_filter_shapes=[(7,3,10),(3,3,20)],
+                     cnn_init=tf.uniform_unit_scaling_initializer(factor=1.43, dtype=dtype),
+                     cnn_pool=[(1,3),(1,3)],
+                     cnn_rnn_zack=False,
+                     rnn_cell_type=None,
+                     rnn_size=0,
+                     rnn_nlayers=0,
+                     rnn_init=None,
+                     rnn_nunroll=1,
+                     rnn_keep_prob=1.0,
+                     dnn_sizes=dense_layer_sizes,
+                     dnn_init=tf.uniform_unit_scaling_initializer(factor=1.15, dtype=dtype),
+                     dnn_keep_prob=1.0,
+                     dnn_nonlin='relu',
+                     target_weight_strategy='seq',
+                     grad_clip=None,
+                     opt=None,
+                     export_feat_name='dnn_{}'.format(FLAGS.export_feature_layer))
 
     if FLAGS.z_normalize_coeffs:
         print 'Normalizing data to zero mean unit var'
@@ -49,7 +68,8 @@ def test():
 
     with tf.Session() as sess:
         print 'Restoring model weights from {}'.format(FLAGS.train_ckpt_fp)
-        model.train_saver.restore(sess, FLAGS.train_ckpt_fp)
+        model_saver = tf.train.Saver(tf.global_variables())
+        model_saver.restore(sess, FLAGS.train_ckpt_fp)
 
         for pkl_fp in tqdm(pkl_fps):
             with open(os.path.join(FLAGS.feats_dir, pkl_fp), 'rb') as f:
@@ -61,16 +81,15 @@ def test():
             if FLAGS.z_normalize_coeffs:
                 apply_z_norm([(None, song_features, None)], mean_per_band, std_per_band)
 
-            song_context, _ = model.prepare_test(song_features, 0)
+            song_context, _ = model.prepare_train_batch([(None, song_features, None)], randomize_charts=False)
             song_export = []
             for i in xrange(0, nframes, BATCH_SIZE):
-                batch_features = song_context[i:i + BATCH_SIZE]
+                batch_features = song_context[0][i:i + BATCH_SIZE]
                 feed_dict = {
-                    model.input_context: batch_features,
-                    model.difficulty: np.zeros(batch_features.shape[0], dtype=np.float32),
-                    model.dropout_keep_p: 1.0
+                    model.feats_audio: batch_features,
+                    model.feats_other: np.zeros((batch_features.shape[0], 1, 0), dtype=np.float32)
                 }
-                batch_export = sess.run(model.export_features, feed_dict=feed_dict)
+                batch_export = sess.run(model.feats_export, feed_dict=feed_dict)
                 song_export.append(batch_export)
             song_export = np.concatenate(song_export)
 
