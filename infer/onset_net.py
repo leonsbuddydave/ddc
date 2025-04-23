@@ -2,6 +2,7 @@ import random
 
 import tensorflow as tf
 import numpy as np
+from tensorflow.keras.layers import Dense, LayerNormalization, Dropout, MultiHeadAttention
 
 dtype = tf.float32
 np_dtype = dtype.as_numpy_dtype
@@ -112,63 +113,27 @@ class OnsetNet:
             nfeats_conv = reduce(lambda x, y: x * y, [int(x) for x in cnn_output.get_shape()[-3:]])
         feats_conv = tf.reshape(cnn_output, [batch_size * rnn_nunroll, nfeats_conv])
         nfeats_tot = nfeats_conv + nfeats
-        feats_all = tf.concat(1, [feats_conv, feats_other])
+        feats_all = tf.concat([feats_conv, feats_other], axis=1)
         print 'feats_cnn: {}'.format(feats_conv.get_shape())
         print 'feats_all: {}'.format(feats_all.get_shape())
 
-        # Project to RNN size
-        rnn_output = feats_all
-        rnn_output_size = nfeats_tot
+        # Transformer
+        transformer_output = feats_all
+        transformer_output_size = nfeats_tot
         if do_rnn:
-            with tf.variable_scope('rnn_proj'):
-                rnn_proj_w = tf.get_variable('W', [nfeats_tot, rnn_size], initializer=tf.uniform_unit_scaling_initializer(factor=1.0, dtype=dtype), dtype=dtype)
-                rnn_proj_b = tf.get_variable('b', [rnn_size], initializer=tf.constant_initializer(0.0), dtype=dtype)
-
-            rnn_inputs = tf.nn.bias_add(tf.matmul(feats_all, rnn_proj_w), rnn_proj_b)
-            rnn_inputs = tf.reshape(rnn_inputs, [batch_size, rnn_nunroll, rnn_size])
-            rnn_inputs = tf.split(rnn_inputs, rnn_nunroll, axis=1)
-            rnn_inputs = [tf.squeeze(input_, [1]) for input_ in rnn_inputs]
-
-            if rnn_cell_type == 'rnn':
-                cell_fn = tf.nn.rnn_cell.BasicRNNCell
-            elif rnn_cell_type == 'gru':
-                cell_fn = tf.nn.rnn_cell.GRUCell
-            elif rnn_cell_type == 'lstm':
-                cell_fn = tf.nn.rnn_cell.BasicLSTMCell
-            else:
-                raise NotImplementedError()
-            cell = cell_fn(rnn_size)
-
-            if mode == 'train' and rnn_keep_prob < 1.0:
-                cell = tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=rnn_keep_prob)
-
-            if rnn_nlayers > 1:
-                cell = tf.nn.rnn_cell.MultiRNNCell([cell] * rnn_nlayers)
-
-            initial_state = cell.zero_state(batch_size, dtype)
-
-            # RNN
-            # TODO: weight init
-            with tf.variable_scope('rnn_unroll'):
-                state = initial_state
-                outputs = []
-                for i in xrange(rnn_nunroll):
-                    if i > 0:
-                        tf.get_variable_scope().reuse_variables()
-                    (cell_output, state) = cell(rnn_inputs[i], state)
-                    outputs.append(cell_output)
-                final_state = state
-
-            rnn_output = tf.reshape(tf.concat(outputs, axis=1), [batch_size * rnn_nunroll, rnn_size])
-            rnn_output_size = rnn_size
-        print 'rnn_output: {}'.format(rnn_output.get_shape())
+            transformer_layer = MultiHeadAttention(num_heads=8, key_dim=rnn_size)
+            transformer_output = transformer_layer(feats_all, feats_all)
+            transformer_output = LayerNormalization()(transformer_output)
+            transformer_output = Dropout(rnn_keep_prob)(transformer_output, training=(mode == 'train'))
+            transformer_output_size = rnn_size
+        print 'transformer_output: {}'.format(transformer_output.get_shape())
 
         # Dense NN
-        dnn_output = rnn_output
-        dnn_output_size = rnn_output_size
+        dnn_output = transformer_output
+        dnn_output_size = transformer_output_size
         if do_dnn:
-            last_layer = rnn_output
-            last_layer_size = rnn_output_size
+            last_layer = transformer_output
+            last_layer_size = transformer_output_size
             for i, layer_size in enumerate(dnn_sizes):
                 layer_name = 'dnn_{}'.format(i)
                 with tf.variable_scope(layer_name):
@@ -249,8 +214,8 @@ class OnsetNet:
         if mode == 'train':
             self.train_op = train_op
         if mode != 'train' and do_rnn:
-            self.initial_state = initial_state
-            self.final_state = final_state
+            self.initial_state = None
+            self.final_state = None
         self.zack_hack_div_2 = zack_hack_div_2
 
         self.mode = mode
